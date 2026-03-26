@@ -1,0 +1,12 @@
+[settings]
+interval_secs = 30
+timeout_secs = 10
+concurrency = 20
+
+[[services]]
+name = "Example"
+url = "https://example.com"
+
+[[services]]
+name = "Httpbin"
+url = "https://httpbin.org/get"
