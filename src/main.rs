@@ -1,16 +1,24 @@
+mod checker;
+mod db;
+mod notifier;
+
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use chrono::Utc;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use sqlx::SqlitePool;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
+use checker::CheckStatus;
+
+// --- Config ---
 
 #[derive(Debug, Deserialize)]
 struct Config {
     settings: Settings,
+    slack: Option<SlackConfig>,
     services: Vec<ServiceConfig>,
 }
 
@@ -19,85 +27,34 @@ struct Settings {
     interval_secs: u64,
     timeout_secs: u64,
     concurrency: usize,
+    #[serde(default = "default_db_path")]
+    db_path: String,
+}
+
+fn default_db_path() -> String {
+    "uptime.db".to_string()
 }
 
 #[derive(Debug, Deserialize, Clone)]
-struct ServiceConfig {
-    name: String,
-    url: String,
+pub struct ServiceConfig {
+    pub name: String,
+    pub url: String,
 }
 
-
-#[derive(Debug, Serialize)]
-struct CheckResult {
-    name: String,
-    url: String,
-    timestamp: String,
-    status: CheckStatus,
-    latency_ms: Option<u64>,
-    http_status: Option<u16>,
-    error: Option<String>,
+#[derive(Debug, Deserialize, Clone)]
+pub struct SlackConfig {
+    pub webhook_url: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum CheckStatus {
-    Up,
-    Down,
-}
-
-
-async fn check_service(client: &Client, svc: &ServiceConfig, timeout: Duration) -> CheckResult {
-    let start = Instant::now();
-    let timestamp = Utc::now().to_rfc3339();
-
-    let result = client.get(&svc.url).timeout(timeout).send().await;
-
-    let latency_ms = start.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(resp) => {
-            let http_status = resp.status().as_u16();
-            if resp.status().is_success() {
-                CheckResult {
-                    name: svc.name.clone(),
-                    url: svc.url.clone(),
-                    timestamp,
-                    status: CheckStatus::Up,
-                    latency_ms: Some(latency_ms),
-                    http_status: Some(http_status),
-                    error: None,
-                }
-            } else {
-                CheckResult {
-                    name: svc.name.clone(),
-                    url: svc.url.clone(),
-                    timestamp,
-                    status: CheckStatus::Down,
-                    latency_ms: Some(latency_ms),
-                    http_status: Some(http_status),
-                    error: Some(format!("HTTP {http_status}")),
-                }
-            }
-        }
-        Err(e) => CheckResult {
-            name: svc.name.clone(),
-            url: svc.url.clone(),
-            timestamp,
-            status: CheckStatus::Down,
-            latency_ms: None,
-            http_status: None,
-            error: Some(e.to_string()),
-        },
-    }
-}
-
+// --- Round ---
 
 async fn run_round(
     client: Arc<Client>,
     services: Arc<Vec<ServiceConfig>>,
     semaphore: Arc<Semaphore>,
     timeout: Duration,
+    pool: Arc<SqlitePool>,
+    slack: Option<Arc<SlackConfig>>,
 ) {
     let handles: Vec<_> = services
         .iter()
@@ -105,38 +62,56 @@ async fn run_round(
         .map(|svc| {
             let client = client.clone();
             let sem = semaphore.clone();
+            let pool = pool.clone();
+            let slack = slack.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire().await.unwrap();
-                check_service(&client, &svc, timeout).await
+                let result = checker::check_service(&client, &svc, timeout).await;
+                checker::log_result(&result);
+
+                // Persist full check history
+                if let Err(e) = db::save_check(&pool, &result).await {
+                    error!(name = %result.name, "Failed to save check: {e}");
+                }
+
+                // Alert only on state transitions (up→down or down→up)
+                let prev = db::get_previous_status(&pool, &result.name).await.unwrap_or(None);
+                let current = result.status.as_str();
+
+                let should_alert = match &prev {
+                    None => result.status == CheckStatus::Down, // first check: alert if already down
+                    Some(p) => p.as_str() != current,          // subsequent: alert on change
+                };
+
+                if should_alert {
+                    if let Some(ref slack) = slack {
+                        let msg = notifier::format_alert(&result);
+                        if let Err(e) =
+                            notifier::send_slack_alert(&client, &slack.webhook_url, &msg).await
+                        {
+                            error!("Slack alert failed: {e}");
+                        }
+                    }
+                }
+
+                // Update state on first check or transition
+                if prev.as_deref() != Some(current) {
+                    if let Err(e) = db::upsert_service_state(&pool, &result).await {
+                        error!(name = %result.name, "Failed to update service state: {e}");
+                    }
+                }
             })
         })
         .collect();
 
     for handle in handles {
-        match handle.await {
-            Ok(result) => log_result(&result),
-            Err(e) => error!("Task panicked: {e}"),
+        if let Err(e) = handle.await {
+            error!("Task panicked: {e}");
         }
     }
 }
 
-fn log_result(r: &CheckResult) {
-    match r.status {
-        CheckStatus::Up => info!(
-            name = %r.name,
-            latency_ms = ?r.latency_ms,
-            http_status = ?r.http_status,
-            "UP"
-        ),
-        CheckStatus::Down => warn!(
-            name = %r.name,
-            error = ?r.error,
-            http_status = ?r.http_status,
-            "DOWN"
-        ),
-    }
-}
-
+// --- Entry point ---
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -149,19 +124,32 @@ async fn main() -> anyhow::Result<()> {
     let timeout = Duration::from_secs(config.settings.timeout_secs);
     let interval = Duration::from_secs(config.settings.interval_secs);
 
+    let pool = Arc::new(db::init(&config.settings.db_path).await?);
     let client = Arc::new(Client::builder().timeout(timeout).build()?);
+    let services = Arc::new(config.settings.concurrency);
+    let semaphore = Arc::new(Semaphore::new(*services));
     let services = Arc::new(config.services);
-    let semaphore = Arc::new(Semaphore::new(config.settings.concurrency));
+    let slack = config.slack.map(Arc::new);
 
     info!(
         services = services.len(),
         interval_secs = config.settings.interval_secs,
         concurrency = config.settings.concurrency,
+        db = %config.settings.db_path,
+        slack = slack.is_some(),
         "Starting uptime monitor"
     );
 
     loop {
-        run_round(client.clone(), services.clone(), semaphore.clone(), timeout).await;
+        run_round(
+            client.clone(),
+            services.clone(),
+            semaphore.clone(),
+            timeout,
+            pool.clone(),
+            slack.clone(),
+        )
+        .await;
         tokio::time::sleep(interval).await;
     }
 }
