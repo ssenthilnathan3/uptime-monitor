@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tracing::{info, warn};
 
 use crate::ServiceConfig;

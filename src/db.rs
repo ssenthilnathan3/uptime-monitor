@@ -2,7 +2,7 @@ use anyhow::Result;
 use sqlx::{sqlite::SqliteConnectOptions, SqlitePool};
 use std::str::FromStr;
 
-use crate::checker::{CheckResult, CheckStatus};
+use crate::checker::CheckResult;
 
 pub async fn init(path: &str) -> Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(&format!("sqlite://{path}"))?

@@ -13,8 +13,6 @@ use tracing::{error, info};
 
 use checker::CheckStatus;
 
-// --- Config ---
-
 #[derive(Debug, Deserialize)]
 struct Config {
     settings: Settings,
@@ -46,8 +44,6 @@ pub struct SlackConfig {
     pub webhook_url: String,
 }
 
-// --- Round ---
-
 async fn run_round(
     client: Arc<Client>,
     services: Arc<Vec<ServiceConfig>>,
@@ -75,12 +71,14 @@ async fn run_round(
                 }
 
                 // Alert only on state transitions (up→down or down→up)
-                let prev = db::get_previous_status(&pool, &result.name).await.unwrap_or(None);
+                let prev = db::get_previous_status(&pool, &result.name)
+                    .await
+                    .unwrap_or(None);
                 let current = result.status.as_str();
 
                 let should_alert = match &prev {
-                    None => result.status == CheckStatus::Down, // first check: alert if already down
-                    Some(p) => p.as_str() != current,          // subsequent: alert on change
+                    None => result.status == CheckStatus::Down,
+                    Some(p) => p.as_str() != current,
                 };
 
                 if should_alert {
@@ -111,14 +109,12 @@ async fn run_round(
     }
 }
 
-// --- Entry point ---
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config_str = std::fs::read_to_string("config.toml")
-        .expect("config.toml not found in current directory");
+    let config_str =
+        std::fs::read_to_string("config.toml").expect("config.toml not found in current directory");
     let config: Config = toml::from_str(&config_str).expect("Invalid config.toml");
 
     let timeout = Duration::from_secs(config.settings.timeout_secs);
@@ -126,8 +122,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = Arc::new(db::init(&config.settings.db_path).await?);
     let client = Arc::new(Client::builder().timeout(timeout).build()?);
-    let services = Arc::new(config.settings.concurrency);
-    let semaphore = Arc::new(Semaphore::new(*services));
+    let semaphore = Arc::new(Semaphore::new(config.settings.concurrency));
     let services = Arc::new(config.services);
     let slack = config.slack.map(Arc::new);
 
